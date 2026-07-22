@@ -141,24 +141,8 @@ pub(crate) trait BoxBackend: Send + Sync {
 /// network data-plane capabilities directly.
 #[async_trait]
 pub(crate) trait BoxNetworkBackend: Send + Sync {
-    /// Describe a tunnel target, returning a self-contained [`BoxTunnel`]:
-    /// remote backends attach a public URL, and either kind can lazily open
-    /// the raw byte stream via [`BoxTunnel::connect`].
+    /// Establish a one-shot tunnel and return its prepared endpoint and connection.
     async fn tunnel(&self, target: SocketAddr) -> BoxliteResult<BoxTunnel>;
-}
-
-/// Network backend used when the current runtime does not provide networking.
-#[cfg(feature = "rest")]
-pub(crate) struct UnsupportedNetworkBackend;
-
-#[cfg(feature = "rest")]
-#[async_trait]
-impl BoxNetworkBackend for UnsupportedNetworkBackend {
-    async fn tunnel(&self, _target: SocketAddr) -> BoxliteResult<BoxTunnel> {
-        Err(BoxliteError::Unsupported(
-            "box networking is unavailable".into(),
-        ))
-    }
 }
 
 /// Backend abstraction for snapshot lifecycle operations on a box.

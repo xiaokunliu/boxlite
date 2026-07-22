@@ -1,69 +1,100 @@
 //! Network sub-resource on LiteBox.
 
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
-use boxlite_shared::errors::BoxliteResult;
+use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
-use crate::net::BoxInternalTunnel;
 use crate::runtime::backend::BoxNetworkBackend;
 
-/// Lazily opens the raw byte stream backing a [`BoxTunnel`]. Each backend
-/// builds one inside its [`BoxNetworkBackend::tunnel`] impl, capturing whatever
-/// it needs (a REST client, a gvproxy handle) so the tunnel stays self-contained
-/// and the backend only has to expose `tunnel`.
-pub(crate) type TunnelConnector = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = BoxliteResult<BoxInternalTunnel>> + Send>>
-        + Send
-        + Sync,
->;
+/// A descriptor for a box service tunnel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoxEndpoint {
+    /// A URI clients can use to reach a remote box service.
+    Uri(String),
+    /// A borrowed descriptor for the prepared local connection.
+    FileDescriptor(i32),
+}
 
 /// Public byte-stream capability for a box service connection.
 pub trait BoxConnection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
 impl<T> BoxConnection for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
-/// A box service tunnel target. Call [`endpoint`](Self::endpoint) first, then
-/// [`connect`](Self::connect) on this handle.
+/// The transport a [`BoxTunnel`] was built over — fixed at construction,
+/// never transitions. Not a state machine.
+enum TunnelTransport {
+    /// Owned descriptor for the local transport; the fd *is* the tunnel.
+    Local(OwnedFd),
+    /// Live remote stream plus the public URI it was opened against.
+    #[cfg(feature = "rest")]
+    Remote {
+        uri: String,
+        connection: Box<dyn BoxConnection>,
+    },
+}
+
+/// A one-shot box service tunnel target.
+///
+/// [`endpoint`](Self::endpoint) lends the descriptor; [`connect`](Self::connect)
+/// consumes the tunnel, so a second connect is a move error at compile time
+/// rather than a runtime state check.
 pub struct BoxTunnel {
-    endpoint: Option<String>,
-    connector: TunnelConnector,
-    stream: Arc<tokio::sync::Mutex<Option<BoxInternalTunnel>>>,
+    transport: TunnelTransport,
 }
 
 impl BoxTunnel {
-    pub(crate) fn new(endpoint: Option<String>, connector: TunnelConnector) -> Self {
+    /// Wrap an owned transport descriptor. The fd *is* the tunnel — no bridge
+    /// copy in between.
+    pub(crate) fn local(fd: OwnedFd) -> Self {
         Self {
-            endpoint,
-            connector,
-            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            transport: TunnelTransport::Local(fd),
         }
     }
 
-    /// Resolve the endpoint, fetching a URL remotely or preparing a local stream.
-    pub async fn endpoint(&self) -> BoxliteResult<Option<String>> {
-        match &self.endpoint {
-            Some(endpoint) => Ok(Some(endpoint.clone())),
-            None => {
-                let mut stream = self.stream.lock().await;
-                if stream.is_none() {
-                    *stream = Some((self.connector)().await?);
-                }
-                Ok(None)
+    #[cfg(feature = "rest")]
+    pub(crate) fn remote<C>(uri: String, connection: C) -> Self
+    where
+        C: BoxConnection + 'static,
+    {
+        Self {
+            transport: TunnelTransport::Remote {
+                uri,
+                connection: Box::new(connection),
+            },
+        }
+    }
+
+    /// Describe the prepared tunnel without opening another connection.
+    pub fn endpoint(&self) -> BoxEndpoint {
+        match &self.transport {
+            TunnelTransport::Local(fd) => BoxEndpoint::FileDescriptor(fd.as_raw_fd()),
+            #[cfg(feature = "rest")]
+            TunnelTransport::Remote { uri, .. } => BoxEndpoint::Uri(uri.clone()),
+        }
+    }
+
+    /// Consume this tunnel into its single connection.
+    ///
+    /// Must run inside a tokio runtime — the local descriptor is registered
+    /// with the reactor here.
+    pub fn connect(self) -> BoxliteResult<Box<dyn BoxConnection>> {
+        match self.transport {
+            TunnelTransport::Local(fd) => {
+                let stream = std::os::unix::net::UnixStream::from(fd);
+                stream.set_nonblocking(true).map_err(|error| {
+                    BoxliteError::Network(format!("configure tunnel descriptor: {error}"))
+                })?;
+                tokio::net::UnixStream::from_std(stream)
+                    .map(|stream| Box::new(stream) as Box<dyn BoxConnection>)
+                    .map_err(|error| {
+                        BoxliteError::Network(format!("open tunnel descriptor: {error}"))
+                    })
             }
+            #[cfg(feature = "rest")]
+            TunnelTransport::Remote { connection, .. } => Ok(connection),
         }
-    }
-
-    /// Consume the prepared local stream or establish the remote stream once.
-    pub async fn connect(&self) -> BoxliteResult<Box<dyn BoxConnection>> {
-        let mut stream = self.stream.lock().await;
-        if let Some(stream) = stream.take() {
-            return Ok(Box::new(stream));
-        }
-        drop(stream);
-        Ok(Box::new((self.connector)().await?))
     }
 }
 
@@ -80,11 +111,7 @@ impl NetworkHandle {
         Self { network_backend }
     }
 
-    /// Describe a tunnel target, returning a [`BoxTunnel`] with endpoint and
-    /// connection operations for both local and remote boxes.
-    ///
-    /// This is the single tunnel entry point: callers that only want the raw
-    /// stream use the SDK-specific `connect()` wrapper.
+    /// Establish a one-shot tunnel and return its prepared endpoint and connection.
     pub async fn tunnel(&self, target: SocketAddr) -> BoxliteResult<BoxTunnel> {
         self.network_backend.tunnel(target).await
     }
@@ -92,103 +119,47 @@ impl NetworkHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use boxlite_shared::errors::BoxliteError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
     use super::*;
 
-    #[derive(Default)]
-    struct TestBackend {
-        connected: Arc<AtomicUsize>,
-    }
+    // Double-connect and endpoint-after-connect need no runtime tests: connect()
+    // takes `self`, so both are move errors at compile time.
 
-    #[async_trait::async_trait]
-    impl BoxNetworkBackend for TestBackend {
-        async fn tunnel(&self, _target: SocketAddr) -> BoxliteResult<BoxTunnel> {
-            let connected = Arc::clone(&self.connected);
-            Ok(BoxTunnel::new(
-                Some("https://3000-box.proxy.example.test".to_string()),
-                Arc::new(move || {
-                    let connected = Arc::clone(&connected);
-                    Box::pin(async move {
-                        connected.fetch_add(1, Ordering::Relaxed);
-                        Err(BoxliteError::Unsupported("test tunnel".to_string()))
-                    })
-                }),
-            ))
-        }
-    }
-
+    #[cfg(feature = "rest")]
     #[tokio::test]
-    async fn box_tunnel_fetches_url_and_connects_lazily() {
-        let backend = Arc::new(TestBackend::default());
-        let network = NetworkHandle::new(backend.clone());
-        let target = "192.168.127.2:3000".parse().unwrap();
+    async fn remote_tunnel_exposes_uri_and_yields_its_connection() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let tunnel = BoxTunnel::remote("https://3000-box.proxy.example.test".to_string(), stream);
 
-        // Obtaining the tunnel does no work — no connect.
-        let tunnel = network.tunnel(target).await.unwrap();
-        assert_eq!(backend.connected.load(Ordering::Relaxed), 0);
-
-        // endpoint() returns the already-resolved URL; connect() remains separate.
-        let endpoint = tunnel.endpoint().await.unwrap();
         assert_eq!(
-            endpoint.as_deref(),
-            Some("https://3000-box.proxy.example.test")
+            tunnel.endpoint(),
+            BoxEndpoint::Uri("https://3000-box.proxy.example.test".to_string())
         );
-        assert_eq!(backend.connected.load(Ordering::Relaxed), 0);
 
-        // Connecting the tunnel triggers exactly one connect.
-        assert!(tunnel.connect().await.is_err());
-        assert_eq!(backend.connected.load(Ordering::Relaxed), 1);
-    }
-
-    struct LocalBackend {
-        peer: Arc<tokio::sync::Mutex<Option<UnixStream>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl BoxNetworkBackend for LocalBackend {
-        async fn tunnel(&self, _target: SocketAddr) -> BoxliteResult<BoxTunnel> {
-            let peer = Arc::clone(&self.peer);
-            Ok(BoxTunnel::new(
-                None,
-                Arc::new(move || {
-                    let peer = Arc::clone(&peer);
-                    Box::pin(async move {
-                        let (stream, other) = UnixStream::pair().map_err(|error| {
-                            BoxliteError::Network(format!("test socket pair failed: {error}"))
-                        })?;
-                        *peer.lock().await = Some(other);
-                        Ok(BoxInternalTunnel::from_local(
-                            stream,
-                            "192.168.127.2:3000".parse().unwrap(),
-                        ))
-                    })
-                }),
-            ))
-        }
+        let mut connection = tunnel.connect().unwrap();
+        peer.write_all(b"one").await.unwrap();
+        let mut response = [0; 3];
+        connection.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"one");
     }
 
     #[tokio::test]
-    async fn local_box_uses_the_same_endpoint_then_connect_flow() {
-        let peer = Arc::new(tokio::sync::Mutex::new(None));
-        let network = NetworkHandle::new(Arc::new(LocalBackend {
-            peer: Arc::clone(&peer),
-        }));
-        let target = "192.168.127.2:3000".parse().unwrap();
+    async fn local_tunnel_hands_back_the_transport_fd() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let fd = OwnedFd::from(stream.into_std().unwrap());
+        let transport_fd = fd.as_raw_fd();
+        let tunnel = BoxTunnel::local(fd);
 
-        let tunnel = network.tunnel(target).await.unwrap();
-        let endpoint = tunnel.endpoint().await.unwrap();
-        assert_eq!(endpoint, None);
-        let mut stream = tunnel.connect().await.unwrap();
-        let mut peer = peer.lock().await.take().unwrap();
+        // Zero-copy contract: the endpoint IS the transport fd, not a bridge.
+        assert_eq!(tunnel.endpoint(), BoxEndpoint::FileDescriptor(transport_fd));
+        assert_eq!(tunnel.endpoint(), BoxEndpoint::FileDescriptor(transport_fd));
 
-        peer.write_all(b"local").await.unwrap();
-        let mut response = [0; 5];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"local");
+        let mut connection = tunnel.connect().unwrap();
+        peer.write_all(b"one").await.unwrap();
+        let mut response = [0; 3];
+        connection.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"one");
     }
 }

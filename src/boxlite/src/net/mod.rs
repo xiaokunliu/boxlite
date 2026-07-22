@@ -238,8 +238,7 @@ pub(crate) enum TunnelStream {
 /// it for concurrent read+write. The transport is swappable behind [`TunnelStream`]
 /// so the same type carries a local unix pipe now and a cloud stream later without
 /// touching [`NetworkBackend::tunnel`]'s signature. `peer_addr()` is the guest
-/// target; [`into_fd`](Self::into_fd) recovers the tunnel's owned OS fd — the
-/// transport-agnostic handle an SDK wraps as a native socket.
+/// target.
 pub struct BoxInternalTunnel {
     stream: TunnelStream,
     peer: SocketAddr,
@@ -259,15 +258,16 @@ impl BoxInternalTunnel {
         self.peer
     }
 
-    /// Recover the tunnel's owned OS file descriptor — the transport-agnostic
-    /// handle an SDK wraps as a native socket (the glue does `.into_raw_fd()`,
-    /// then e.g. Python `socket.socket(fileno=fd)`). `None` for a transport with
-    /// no single host fd (a cloud stream), where callers fall back to a
-    /// local-listener bridge. This is the FFI-handoff shape libtailscale uses.
-    pub fn into_fd(self) -> Option<OwnedFd> {
+    /// Recover the transport's owned OS fd — the fd *is* the tunnel, so the
+    /// consumer holds the real socket with no bridge in between.
+    ///
+    /// tokio → std deregisters the socket from the reactor before the fd
+    /// changes hands.
+    pub(crate) fn into_owned_fd(self) -> BoxliteResult<OwnedFd> {
         match self.stream {
-            // tokio → std deregisters from the reactor; the std socket owns the fd.
-            TunnelStream::Local(stream) => stream.into_std().ok().map(OwnedFd::from),
+            TunnelStream::Local(stream) => stream.into_std().map(OwnedFd::from).map_err(|error| {
+                BoxliteError::Network(format!("detach tunnel socket for handoff: {error}"))
+            }),
         }
     }
 }
@@ -684,6 +684,5 @@ mod tests {
         assert_eq!(&back, b"pong");
 
         // the owned OS fd is recoverable with no unsafe downcast (SDK handoff)
-        assert!(tunnel.into_fd().is_some());
     }
 }
