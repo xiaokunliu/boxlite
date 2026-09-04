@@ -47,6 +47,7 @@ package-lock.json
 yarn.lock
 !/apps/yarn.lock
 !/apps/infra/package-lock.json
+!/sdks/node/package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -230,3 +231,7 @@ regions-*.png
 runners-*.png
 term-*.png
 test-*.png
+.venv-infra.partial.*
+.venv-infra/
+.venv-infra.partial.*/
+target/

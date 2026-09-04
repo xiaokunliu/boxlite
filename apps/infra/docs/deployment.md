@@ -311,10 +311,14 @@ verifies the ECR image and Runner release assets before invoking SST.
 calls it for the commit being deployed (`v<version>-<sha>`, into that stage);
 dispatching it with `operation=build` builds a released tag once into dev, and
 `operation=promote` copies that exact manifest registry-side, addressed by
-digest, rather than rebuilding. The dispatched operations run from `main`: a
-release event runs on a tag ref, and the deployment Environments that hold the
-AWS role are branch-scoped, so a tag-triggered job never reaches its
-credentials.
+digest, rather than rebuilding. An ECR registry is one account in one region,
+and the job binds to the *target* stage's Environment, so `source_region` is how
+a promote is told where to read when the two stages differ — dev in
+`ap-southeast-1`, prod in `us-west-2`. Omitted, it reads the source in the
+target's region, which is right whenever both share one. The dispatched
+operations run from `main`: a release event runs on a tag ref, and the
+deployment Environments that hold the AWS role are branch-scoped, so a
+tag-triggered job never reaches its credentials.
 
 Either path first runs deployment safety tests that require every Runner to
 retain `protect: true` and the AMI/user-data ignore rules. The build path then
@@ -404,7 +408,7 @@ each stage you run.
 
 | What | Stored in | Set by |
 | --- | --- | --- |
-| App secrets (`OIDC_CLIENT_ID`, Auth0 Management API, Svix, PostHog, `USAGE_EXPORT_TOKEN`) | SST secret store | `npm run bootstrap`; others via `npm run sst -- secret set <NAME> --stage <stage>` reading stdin |
+| App secrets (`OIDC_CLIENT_ID`, Auth0 Management API, Svix, PostHog, `USAGE_EXPORT_TOKEN`) | SST secret store | `npm run bootstrap`; others via `npm run sst -- secret set <NAME> --stage <stage>` reading stdin. `USAGE_EXPORT_TOKEN` also authenticates Commerce plan reads for CREATE BOX admission |
 | SES SMTP credential (`SMTP_USER`, `SMTP_PASSWORD`) | SST secret store | `npm run bootstrap -- --stage <stage> --provision-ses`, which mints the send-only IAM user the deploy role cannot create and derives the SMTP password from its key. Rerunning rotates it |
 | Cloudflare creds (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_DEFAULT_ACCOUNT_ID`) | AWS SSM SecureString for local use; GitHub Environment secrets for CI (which win) | `npm run bootstrap` |
 | Stage config (`STACK_DOMAIN`, `OIDC_*`, toggles) | SST secret store | `npm run bootstrap`, from your local `.env` |
@@ -485,7 +489,7 @@ all require the same manual token.
 gh workflow run deploy-infra.yml --ref main -f stage=dev -f apply=false -f ref=<full-commit-sha>
 
 gh workflow run build-apps-api-image.yml --ref main -f operation=build -f version=0.9.8
-gh workflow run build-apps-api-image.yml --ref main -f operation=promote -f stage=prod -f version=0.9.8
+gh workflow run build-apps-api-image.yml --ref main -f operation=promote -f stage=prod -f version=0.9.8 -f source_region=ap-southeast-1
 gh workflow run deploy-release.yml --ref main -f stage=prod -f version=0.9.8
 npm run runner:build-artifact -- --stage dev # local linux/amd64 build + private S3 stage
 

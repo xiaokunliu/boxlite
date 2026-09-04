@@ -39,6 +39,7 @@ pub use litebox::{
 pub use portal::GuestSession;
 pub use runtime::{AuthHandle, BoxliteRuntime, ImageHandle, Principal};
 
+pub use boxlite_shared::BoxByteStream;
 pub use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 pub use disk::DiskInfo;
 pub use event_listener::{AuditEvent, AuditEventKind, AuditEventListener, EventListener};
@@ -46,8 +47,8 @@ pub use litebox::SnapshotHandle;
 pub use litebox::archive::ArchiveManifest;
 pub use litebox::snapshot_mgr::SnapshotInfo;
 pub use litebox::{
-    BoxCommand, CopyOptions, ExecResult, ExecStderr, ExecStdin, ExecStdout, Execution, ExecutionId,
-    HealthState, HealthStatus,
+    AttachOptions, BoxCommand, CopyOptions, CopySourceKind, ExecResult, ExecStderr, ExecStdin,
+    ExecStdout, Execution, ExecutionId, HealthState, HealthStatus,
 };
 pub use metrics::{BoxMetrics, RuntimeMetrics};
 pub use runtime::advanced_options::{
@@ -63,8 +64,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use runtime::id::{BaseDiskID, BaseDiskIDMint, BoxID, BoxIDMint};
 pub use runtime::types::ContainerID;
 pub use runtime::types::{
-    BoxInfo, BoxLifecyclePolicy, BoxState, BoxStateInfo, BoxStatus, NetworkDirectionInfo,
-    NetworkInfo, PublishedPort,
+    BoxInfo, BoxLifecyclePolicy, BoxState, BoxStateInfo, BoxStatus, InboundNetworkInfo,
+    NetworkInfo, OutboundNetworkInfo, PublishedPort,
 };
 
 #[cfg(feature = "rest")]
